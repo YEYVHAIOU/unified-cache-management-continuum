@@ -19,8 +19,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
 from ucm.logger import init_logger
-from ucm.shared.metrics import ucmmonitor
-from ucm.shared.metrics.observability import UCMStatsLogger
 from ucm.store.factory import UcmConnectorFactory
 from ucm.store.ucmstore import Task, UcmKVStoreBase
 from ucm.utils import Config
@@ -172,6 +170,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         self.metrics_config = self.launch_config.get("metrics_config_path", "")
         if self.metrics_config:
+            from ucm.shared.metrics import ucmmonitor
+            from ucm.shared.metrics.observability import UCMStatsLogger
+
             self.stats_logger = UCMStatsLogger(
                 vllm_config.model_config.served_model_name,
                 self.global_rank,
