@@ -1,0 +1,7 @@
+add_subdirectory(shared)
+if(BUILD_UCM_STORE)
+    add_subdirectory(store)
+endif()
+if(BUILD_UCM_SPARSE)
+    add_subdirectory(sparse)
+endif()
