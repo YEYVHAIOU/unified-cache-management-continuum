@@ -35,6 +35,10 @@ logger = init_logger(__name__)
 SUCCESS = 0
 FAILURE = -1
 
+# Shared state for scheduler/worker UcmDramStore instances under vLLM uniproc.
+_PROCESS_SHARED_DRAM_CACHE: Dict[str, Any] = {}
+_PROCESS_SHARED_CACHED_BLOCKS: set[str] = set()
+
 if torch.cuda.is_available():
     device = torch.cuda
 elif hasattr(torch, "musa") and torch.musa.is_available():
@@ -61,12 +65,11 @@ class UcmDramStore(UcmKVStoreBase):
 
     def __init__(self, config: Dict):
         super().__init__(config)
-        self.dram_cache: Dict[str, any] = {}
+        self.dram_cache = _PROCESS_SHARED_DRAM_CACHE
         self.max_cache_byte = int(config.get("max_cache_size", 5368709120))
         self.kv_block_size = int(config.get("kv_block_size", 262144))
         self.max_block_num = self.max_cache_byte // self.kv_block_size
-        if config["role"] == "scheduler":
-            self.cached_blocks = set()
+        self.cached_blocks = _PROCESS_SHARED_CACHED_BLOCKS
 
     def cc_store(self) -> int:
         """
@@ -149,7 +152,8 @@ class UcmDramStore(UcmKVStoreBase):
             task(Task).
         """
         task = DramTask()
-        if len(self.dram_cache) > self.max_block_num:
+        new_block_num = len(set(block_ids) - self.cached_blocks)
+        if len(self.cached_blocks) + new_block_num > self.max_block_num:
             logger.warning(
                 "Dram cache usage exceeds limit! No more kv cache offload! Try to increase your initial max_cache_size."
             )
