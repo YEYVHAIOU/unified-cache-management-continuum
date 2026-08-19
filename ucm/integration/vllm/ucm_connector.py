@@ -144,6 +144,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
             "load_blocks": 0,
         }
         logger.info("UCM offload policy=%s", self.offload_policy)
+        self.kv_pressure: Optional[float] = None
+        self.pressure_threshold = float(
+            os.environ.get("UCM_PRESSURE_THRESHOLD", "0.65")
+        )
+        if not 0.0 <= self.pressure_threshold <= 1.0:
+            raise ValueError(
+                f"UCM_PRESSURE_THRESHOLD must be in [0, 1], "
+                f"got {self.pressure_threshold}"
+            )
+        logger.info(
+            "UCM pressure threshold=%.3f",
+            self.pressure_threshold,
+        )
         self.load_only_first_rank: bool = (
             self.launch_config.get("load_only_first_rank", self.is_mla) and self.is_mla
         )
@@ -285,14 +298,24 @@ class UCMDirectConnector(KVConnectorBase_V1):
     ):
         pass
 
+    def set_runtime_context(
+        self,
+        *,
+        kv_pressure: Optional[float] = None,
+    ) -> None:
+        if kv_pressure is not None and not 0.0 <= kv_pressure <= 1.0:
+            raise ValueError(
+                f"kv_pressure must be in [0, 1], got {kv_pressure}"
+            )
+        self.kv_pressure = kv_pressure
+
     def _apply_offload_policy(
         self,
         ucm_block_ids: list[str],
         vllm_block_ids: list[int],
     ) -> tuple[list[str], list[int]]:
         """Select newly generated KV blocks for backing storage.
-        P1 is behavior-preserving. The pressure and joint modes intentionally
-        use eager fallback until vLLM pressure and Continuum hints are wired.
+        Pressure mode uses live vLLM KV-cache usage to gate backing writes.\n        Joint mode still falls back to eager until Continuum hints are wired.
         """
         assert len(ucm_block_ids) == len(vllm_block_ids)
         candidates = len(ucm_block_ids)
@@ -303,20 +326,39 @@ class UCMDirectConnector(KVConnectorBase_V1):
             selected_ucm = ucm_block_ids
             selected_vllm = vllm_block_ids
             reason = "eager"
+        elif self.offload_policy == "pressure":
+            if self.kv_pressure is None:
+                selected_ucm = ucm_block_ids
+                selected_vllm = vllm_block_ids
+                reason = "pressure_missing_eager_fallback"
+            elif self.kv_pressure < self.pressure_threshold:
+                selected_ucm = []
+                selected_vllm = []
+                reason = "low_pressure_skip"
+            else:
+                selected_ucm = ucm_block_ids
+                selected_vllm = vllm_block_ids
+                reason = "high_pressure_dump"
         else:
             selected_ucm = ucm_block_ids
             selected_vllm = vllm_block_ids
-            reason = f"{self.offload_policy}_scaffold_eager_fallback"
+            reason = "joint_scaffold_eager_fallback"
         selected = len(selected_ucm)
         skipped = candidates - selected
         self.offload_stats["offload_selected_blocks"] += selected
         self.offload_stats["offload_skipped_blocks"] += skipped
         if selected:
             self.offload_stats["dump_batches"] += 1
+        pressure_text = (
+            "none" if self.kv_pressure is None
+            else f"{self.kv_pressure:.6f}"
+        )
         logger.info(
-            "UCM_OFFLOAD_DECISION policy=%s candidates=%d "
-            "selected=%d skipped=%d reason=%s",
+            "UCM_OFFLOAD_DECISION policy=%s pressure=%s threshold=%.3f "
+            "candidates=%d selected=%d skipped=%d reason=%s",
             self.offload_policy,
+            pressure_text,
+            self.pressure_threshold,
             candidates,
             selected,
             skipped,
@@ -817,6 +859,11 @@ class UCMConnector(KVConnectorBase_V1):
             self.connector = UCMMockConnector(vllm_config, role)
         else:
             self.connector = UCMDirectConnector(vllm_config, role)
+
+    def set_runtime_context(self, **kwargs) -> None:
+        setter = getattr(self.connector, "set_runtime_context", None)
+        if callable(setter):
+            setter(**kwargs)
 
     def get_num_new_matched_tokens(
         self,
