@@ -144,6 +144,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
             "load_blocks": 0,
         }
         logger.info("UCM offload policy=%s", self.offload_policy)
+        self.transfer_profile = (
+            os.environ.get("UCM_TRANSFER_PROFILE", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        logger.info(
+            "UCM transfer profiling=%s",
+            self.transfer_profile,
+        )
         self.kv_pressure: Optional[float] = None
         self.pressure_threshold = float(
             os.environ.get("UCM_PRESSURE_THRESHOLD", "0.65")
@@ -675,6 +683,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self._init_kv_caches_from_forward_context(forward_context)
 
         request_to_task: dict[str, Optional[Task]] = {}
+        request_to_submit_start_ms: dict[str, float] = {}
+        request_to_enqueue_ms: dict[str, float] = {}
+        request_to_block_count: dict[str, int] = {}
         req_broadcast_addr = {}
         is_load = False
         num_loaded_block = 0
@@ -694,9 +705,15 @@ class UCMDirectConnector(KVConnectorBase_V1):
             ucm_total_block_ids, ucm_offsets, dst_tensor_addr = self._generate_task(
                 vllm_block_ids, ucm_block_ids
             )
+            request_to_block_count[request_id] = len(ucm_block_ids)
             if self.global_rank == 0 or not self.load_only_first_rank:
+                submit_start_ms = time.perf_counter() * 1000
+                request_to_submit_start_ms[request_id] = submit_start_ms
                 request_to_task[request_id] = self.store.load(
                     ucm_total_block_ids, ucm_offsets, dst_tensor_addr
+                )
+                request_to_enqueue_ms[request_id] = (
+                    time.perf_counter() * 1000 - submit_start_ms
                 )
             else:
                 request_to_task[request_id] = None
@@ -705,11 +722,46 @@ class UCMDirectConnector(KVConnectorBase_V1):
         for request_id, task in request_to_task.items():
             # TODO error handling
             if self.global_rank == 0 or not self.load_only_first_rank:
-                if self.store.wait(task) != 0:
+                wait_start_ms = time.perf_counter() * 1000
+                ret = self.store.wait(task)
+                wait_ms = time.perf_counter() * 1000 - wait_start_ms
+                success = ret == 0
+                if not success:
                     logger.error(f"request {request_id} load kv cache failed.")
+                if self.transfer_profile:
+                    blocks = request_to_block_count.get(request_id, 0)
+                    enqueue_ms = request_to_enqueue_ms.get(request_id, 0.0)
+                    submit_start_ms = request_to_submit_start_ms.get(
+                        request_id, time.perf_counter() * 1000
+                    )
+                    wall_ms = time.perf_counter() * 1000 - submit_start_ms
+                    cuda_ms = getattr(task, "transfer_ms", None)
+                    cuda_ms_value = -1.0 if cuda_ms is None else float(cuda_ms)
+                    logger.info(
+                        "UCM_TRANSFER direction=load request=%s "
+                        "blocks=%d bytes=%d enqueue_ms=%.6f "
+                        "wait_ms=%.6f cuda_ms=%.6f wall_ms=%.6f success=%d",
+                        request_id,
+                        blocks,
+                        blocks * self.block_data_size,
+                        enqueue_ms,
+                        wait_ms,
+                        cuda_ms_value,
+                        wall_ms,
+                        int(success),
+                    )
             if self.load_only_first_rank:
                 self._broadcast(req_broadcast_addr[request_id])
         load_end_time = time.perf_counter() * 1000
+        if self.transfer_profile and is_load:
+            logger.info(
+                "UCM_TRANSFER_BATCH direction=load requests=%d "
+                "blocks=%d bytes=%d wall_ms=%.6f",
+                num_loaded_request,
+                num_loaded_block,
+                num_loaded_block * self.block_data_size,
+                load_end_time - load_start_time,
+            )
         load_speed = (
             num_loaded_block
             * self.block_data_size
@@ -753,6 +805,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         request_to_task: dict[str, Task] = {}
         request_to_blocks: dict[str, list[str]] = {}
+        request_to_submit_start_ms: dict[str, float] = {}
+        request_to_enqueue_ms: dict[str, float] = {}
         is_save = False
         num_saved_block = 0
         num_saved_request = 0
@@ -785,19 +839,59 @@ class UCMDirectConnector(KVConnectorBase_V1):
             ucm_total_block_ids, ucm_offsets, dst_tensor_addr = self._generate_task(
                 vllm_block_ids, ucm_block_ids
             )
+            submit_start_ms = time.perf_counter() * 1000
+            request_to_submit_start_ms[request_id] = submit_start_ms
             request_to_task[request_id] = self.store.dump(
                 ucm_total_block_ids, ucm_offsets, dst_tensor_addr
+            )
+            request_to_enqueue_ms[request_id] = (
+                time.perf_counter() * 1000 - submit_start_ms
             )
             request_to_blocks[request_id] = ucm_block_ids
 
         for request_id, task in request_to_task.items():
             ucm_block_ids = request_to_blocks[request_id]
-            if self.store.wait(task) == 0:
+            wait_start_ms = time.perf_counter() * 1000
+            ret = self.store.wait(task)
+            wait_ms = time.perf_counter() * 1000 - wait_start_ms
+            success = ret == 0
+            if success:
                 self.store.commit(ucm_block_ids, True)
             else:
                 logger.error(f"request {request_id} dump kv cache failed.")
                 self.store.commit(ucm_block_ids, False)
+            if self.transfer_profile:
+                blocks = len(ucm_block_ids)
+                enqueue_ms = request_to_enqueue_ms.get(request_id, 0.0)
+                submit_start_ms = request_to_submit_start_ms.get(
+                    request_id, time.perf_counter() * 1000
+                )
+                wall_ms = time.perf_counter() * 1000 - submit_start_ms
+                cuda_ms = getattr(task, "transfer_ms", None)
+                cuda_ms_value = -1.0 if cuda_ms is None else float(cuda_ms)
+                logger.info(
+                    "UCM_TRANSFER direction=dump request=%s "
+                    "blocks=%d bytes=%d enqueue_ms=%.6f "
+                    "wait_ms=%.6f cuda_ms=%.6f wall_ms=%.6f success=%d",
+                    request_id,
+                    blocks,
+                    blocks * self.block_data_size,
+                    enqueue_ms,
+                    wait_ms,
+                    cuda_ms_value,
+                    wall_ms,
+                    int(success),
+                )
         save_end_time = time.perf_counter() * 1000
+        if self.transfer_profile and is_save:
+            logger.info(
+                "UCM_TRANSFER_BATCH direction=dump requests=%d "
+                "blocks=%d bytes=%d wall_ms=%.6f",
+                num_saved_request,
+                num_saved_block,
+                num_saved_block * self.block_data_size,
+                save_end_time - save_start_time,
+            )
         save_speed = (
             num_saved_block
             * self.block_data_size

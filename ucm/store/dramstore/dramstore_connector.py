@@ -55,7 +55,9 @@ else:
 @dataclass
 class DramTask(Task):
     task_id: str = "1"
+    start_event: Optional[Any] = None
     event: Optional[Any] = None
+    transfer_ms: Optional[float] = None
 
 
 class UcmDramStore(UcmKVStoreBase):
@@ -129,8 +131,10 @@ class UcmDramStore(UcmKVStoreBase):
         """
         task = DramTask()
         stream = device.Stream()
+        task.start_event = device.Event(enable_timing=True)
         task.event = device.Event(enable_timing=True)
         with device.stream(stream):
+            task.start_event.record(stream=stream)
             for i, block_id in enumerate(block_ids):
                 key = block_id + "_" + str(offset[i])
                 dst_tensor[i].copy_(self.dram_cache[key], non_blocking=True)
@@ -161,8 +165,10 @@ class UcmDramStore(UcmKVStoreBase):
             return task
         else:
             stream = device.Stream()
+            task.start_event = device.Event(enable_timing=True)
             task.event = device.Event(enable_timing=True)
             with device.stream(stream):
+                task.start_event.record(stream=stream)
                 for i, block_id in enumerate(block_ids):
                     key = block_id + "_" + str(offset[i])
                     self.dram_cache[key] = src_tensor[i].to("cpu", non_blocking=True)
@@ -226,6 +232,11 @@ class UcmDramStore(UcmKVStoreBase):
         try:
             event = task.event
             event.synchronize()
+            if task.start_event is not None and event is not None:
+                try:
+                    task.transfer_ms = task.start_event.elapsed_time(event)
+                except Exception:
+                    task.transfer_ms = None
             return SUCCESS
         except Exception as e:
             logger.error(f"Error waiting cache for block IDs: {e}")
