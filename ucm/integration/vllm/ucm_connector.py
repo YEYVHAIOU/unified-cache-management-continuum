@@ -192,6 +192,44 @@ class UCMDirectConnector(KVConnectorBase_V1):
             self.joint_high_pressure_threshold,
             self.joint_after_ttl_threshold,
         )
+        self.joint_decision_mode = os.environ.get(
+            "UCM_JOINT_DECISION", "probability"
+        ).strip().lower()
+        if self.joint_decision_mode not in {"probability", "cost"}:
+            raise ValueError(
+                "UCM_JOINT_DECISION must be probability or cost"
+            )
+
+        self.dump_cost_intercept_ms = float(
+            os.environ.get("UCM_DUMP_COST_INTERCEPT_MS", "2.8000")
+        )
+        self.dump_cost_per_block_ms = float(
+            os.environ.get("UCM_DUMP_COST_PER_BLOCK_MS", "1.5005")
+        )
+        self.load_cost_intercept_ms = float(
+            os.environ.get("UCM_LOAD_COST_INTERCEPT_MS", "0.3510")
+        )
+        self.load_cost_per_block_ms = float(
+            os.environ.get("UCM_LOAD_COST_PER_BLOCK_MS", "0.3345")
+        )
+
+        if min(
+            self.dump_cost_intercept_ms,
+            self.dump_cost_per_block_ms,
+            self.load_cost_intercept_ms,
+            self.load_cost_per_block_ms,
+        ) < 0:
+            raise ValueError("UCM transfer cost coefficients must be >= 0")
+
+        logger.info(
+            "UCM joint decision=%s dump_cost=%.4f+%.4f*n_ms "
+            "load_cost=%.4f+%.4f*n_ms",
+            self.joint_decision_mode,
+            self.dump_cost_intercept_ms,
+            self.dump_cost_per_block_ms,
+            self.load_cost_intercept_ms,
+            self.load_cost_per_block_ms,
+        )
         self.load_only_first_rank: bool = (
             self.launch_config.get("load_only_first_rank", self.is_mla) and self.is_mla
         )
@@ -360,6 +398,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.offload_stats["offload_candidate_blocks"] += candidates
         if candidates == 0:
             return ucm_block_ids, vllm_block_ids
+        p_after_ttl_log = -1.0
+        benefit_ms_log = -1.0
+        cost_ms_log = -1.0
+        marginal_prefill_ms_log = -1.0
+        context_blocks_log = 0
         if self.offload_policy == "eager":
             selected_ucm = ucm_block_ids
             selected_vllm = vllm_block_ids
@@ -412,17 +455,71 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     p_after_ttl = max(
                         0.0, min(1.0, 1.0 - finish_probability)
                     )
-                    if (
-                        p_after_ttl
-                        >= self.joint_after_ttl_threshold
-                    ):
-                        selected_ucm = ucm_block_ids
-                        selected_vllm = vllm_block_ids
-                        reason = "joint_temporal_dump"
+                    p_after_ttl_log = p_after_ttl
+
+                    if self.joint_decision_mode == "probability":
+                        if (
+                            p_after_ttl
+                            >= self.joint_after_ttl_threshold
+                        ):
+                            selected_ucm = ucm_block_ids
+                            selected_vllm = vllm_block_ids
+                            reason = "joint_temporal_dump"
+                        else:
+                            selected_ucm = []
+                            selected_vllm = []
+                            reason = "joint_temporal_skip"
                     else:
-                        selected_ucm = []
-                        selected_vllm = []
-                        reason = "joint_temporal_skip"
+                        context_tokens = max(
+                            1, int(hint.get("context_tokens", 1))
+                        )
+                        context_blocks = max(
+                            1,
+                            (context_tokens + self.block_size - 1)
+                            // self.block_size,
+                        )
+                        context_blocks_log = context_blocks
+
+                        marginal_fraction = min(
+                            1.0, candidates / context_blocks
+                        )
+                        prefill_total_ms = max(
+                            0.0,
+                            float(
+                                hint.get("prefill_reload_cost", 0.0)
+                            ) * 1000.0,
+                        )
+                        marginal_prefill_ms = (
+                            prefill_total_ms * marginal_fraction
+                        )
+                        marginal_prefill_ms_log = marginal_prefill_ms
+
+                        dump_ms = (
+                            self.dump_cost_intercept_ms
+                            + self.dump_cost_per_block_ms * candidates
+                        )
+                        load_ms = (
+                            self.load_cost_intercept_ms
+                            + self.load_cost_per_block_ms * candidates
+                        )
+
+                        benefit_ms = (
+                            p_after_ttl * marginal_prefill_ms
+                        )
+                        expected_cost_ms = (
+                            dump_ms + p_after_ttl * load_ms
+                        )
+                        benefit_ms_log = benefit_ms
+                        cost_ms_log = expected_cost_ms
+
+                        if benefit_ms > expected_cost_ms:
+                            selected_ucm = ucm_block_ids
+                            selected_vllm = vllm_block_ids
+                            reason = "joint_cost_dump"
+                        else:
+                            selected_ucm = []
+                            selected_vllm = []
+                            reason = "joint_cost_skip"
         selected = len(selected_ucm)
         skipped = candidates - selected
         self.offload_stats["offload_selected_blocks"] += selected
@@ -435,7 +532,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         )
         logger.info(
             "UCM_OFFLOAD_DECISION policy=%s pressure=%s threshold=%.3f "
-            "candidates=%d selected=%d skipped=%d reason=%s",
+            "candidates=%d selected=%d skipped=%d reason=%s "
+            "p_after_ttl=%.6f benefit_ms=%.6f cost_ms=%.6f "
+            "marginal_prefill_ms=%.6f context_blocks=%d",
             self.offload_policy,
             pressure_text,
             self.pressure_threshold,
@@ -443,6 +542,11 @@ class UCMDirectConnector(KVConnectorBase_V1):
             selected,
             skipped,
             reason,
+            p_after_ttl_log,
+            benefit_ms_log,
+            cost_ms_log,
+            marginal_prefill_ms_log,
+            context_blocks_log,
         )
         return selected_ucm, selected_vllm
 
