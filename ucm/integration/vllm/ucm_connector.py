@@ -157,6 +157,33 @@ class UCMDirectConnector(KVConnectorBase_V1):
             "UCM pressure threshold=%.3f",
             self.pressure_threshold,
         )
+        self.joint_high_pressure_threshold = float(
+            os.environ.get("UCM_JOINT_HIGH_THRESHOLD", "0.90")
+        )
+        self.joint_after_ttl_threshold = float(
+            os.environ.get("UCM_JOINT_AFTER_TTL_THRESHOLD", "0.50")
+        )
+        if not (
+            self.pressure_threshold
+            <= self.joint_high_pressure_threshold
+            <= 1.0
+        ):
+            raise ValueError(
+                "UCM_JOINT_HIGH_THRESHOLD must be between "
+                "UCM_PRESSURE_THRESHOLD and 1.0"
+            )
+        if not 0.0 <= self.joint_after_ttl_threshold <= 1.0:
+            raise ValueError(
+                "UCM_JOINT_AFTER_TTL_THRESHOLD must be in [0, 1]"
+            )
+        self.continuum_hints: dict[str, dict] = {}
+        logger.info(
+            "UCM joint thresholds low=%.3f high=%.3f "
+            "after_ttl=%.3f",
+            self.pressure_threshold,
+            self.joint_high_pressure_threshold,
+            self.joint_after_ttl_threshold,
+        )
         self.load_only_first_rank: bool = (
             self.launch_config.get("load_only_first_rank", self.is_mla) and self.is_mla
         )
@@ -302,17 +329,20 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self,
         *,
         kv_pressure: Optional[float] = None,
+        continuum_hints: Optional[dict[str, dict]] = None,
     ) -> None:
         if kv_pressure is not None and not 0.0 <= kv_pressure <= 1.0:
             raise ValueError(
                 f"kv_pressure must be in [0, 1], got {kv_pressure}"
             )
         self.kv_pressure = kv_pressure
+        self.continuum_hints = continuum_hints or {}
 
     def _apply_offload_policy(
         self,
         ucm_block_ids: list[str],
         vllm_block_ids: list[int],
+        request_id: Optional[str] = None,
     ) -> tuple[list[str], list[int]]:
         """Select newly generated KV blocks for backing storage.
         Pressure mode uses live vLLM KV-cache usage to gate backing writes.\n        Joint mode still falls back to eager until Continuum hints are wired.
@@ -340,9 +370,51 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 selected_vllm = vllm_block_ids
                 reason = "high_pressure_dump"
         else:
-            selected_ucm = ucm_block_ids
-            selected_vllm = vllm_block_ids
-            reason = "joint_scaffold_eager_fallback"
+            # Joint mode: pressure handles the extremes; Continuum
+            # decides whether medium-pressure KV is worth backing.
+            if self.kv_pressure is None:
+                selected_ucm = ucm_block_ids
+                selected_vllm = vllm_block_ids
+                reason = "joint_missing_pressure_eager_fallback"
+            elif self.kv_pressure < self.pressure_threshold:
+                selected_ucm = []
+                selected_vllm = []
+                reason = "joint_low_pressure_skip"
+            elif (
+                self.kv_pressure
+                >= self.joint_high_pressure_threshold
+            ):
+                selected_ucm = ucm_block_ids
+                selected_vllm = vllm_block_ids
+                reason = "joint_high_pressure_force_dump"
+            else:
+                hint = self.continuum_hints.get(request_id or "")
+                if hint is None:
+                    selected_ucm = ucm_block_ids
+                    selected_vllm = vllm_block_ids
+                    reason = "joint_missing_hint_pressure_dump"
+                elif hint.get("history_source") == "fixed_cold_start":
+                    selected_ucm = ucm_block_ids
+                    selected_vllm = vllm_block_ids
+                    reason = "joint_cold_start_pressure_dump"
+                else:
+                    finish_probability = float(
+                        hint.get("finish_probability", 0.0)
+                    )
+                    p_after_ttl = max(
+                        0.0, min(1.0, 1.0 - finish_probability)
+                    )
+                    if (
+                        p_after_ttl
+                        >= self.joint_after_ttl_threshold
+                    ):
+                        selected_ucm = ucm_block_ids
+                        selected_vllm = vllm_block_ids
+                        reason = "joint_temporal_dump"
+                    else:
+                        selected_ucm = []
+                        selected_vllm = []
+                        reason = "joint_temporal_skip"
         selected = len(selected_ucm)
         skipped = candidates - selected
         self.offload_stats["offload_selected_blocks"] += selected
@@ -368,6 +440,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
     def _generate_dispatch_meta(
         self,
+        request_id: str,
         req_meta: RequestMeta,
         new_tokens: int,
         vllm_block_ids: list[int],
@@ -414,6 +487,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 self._apply_offload_policy(
                     dump_ucm_block_ids,
                     dump_vllm_block_ids,
+                    request_id=request_id,
                 )
             )
         return RequestDispatchMeta(
@@ -431,6 +505,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             req_meta = self.requests_meta.get(request_id)
             if req_meta:
                 requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
+                    request_id,
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
                     vllm_block_ids,
@@ -450,6 +525,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     if scheduled_cached_reqs.new_block_ids[i] != None:
                         new_block_ids = scheduled_cached_reqs.new_block_ids[i][0]
                     requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
+                    request_id,
                         req_meta,
                         scheduler_output.num_scheduled_tokens[request_id],
                         new_block_ids,
@@ -461,6 +537,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 req_meta = self.requests_meta.get(request_id)
                 if req_meta:
                     requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
+                    request_id,
                         req_meta,
                         scheduler_output.num_scheduled_tokens[request_id],
                         request.new_block_ids[0],
