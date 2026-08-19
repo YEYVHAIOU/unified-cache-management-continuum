@@ -1,5 +1,6 @@
 import hashlib
 import itertools
+import math
 import os
 import pickle
 import time
@@ -151,6 +152,53 @@ class UCMDirectConnector(KVConnectorBase_V1):
         logger.info(
             "UCM transfer profiling=%s",
             self.transfer_profile,
+        )
+        self.what_policy = os.environ.get(
+            "UCM_WHAT_POLICY", "full"
+        ).strip().lower()
+        if self.what_policy not in {
+            "full",
+            "prefix_sparse",
+            "frontier_tail",
+        }:
+            raise ValueError(
+                f"Invalid UCM_WHAT_POLICY={self.what_policy!r}; "
+                "expected full, prefix_sparse, or frontier_tail"
+            )
+        try:
+            self.retain_ratio = float(
+                os.environ.get("UCM_RETAIN_RATIO", "1.0")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "UCM_RETAIN_RATIO must be a float"
+            ) from exc
+        if not 0.0 <= self.retain_ratio <= 1.0:
+            raise ValueError(
+                f"UCM_RETAIN_RATIO must be in [0, 1], "
+                f"got {self.retain_ratio}"
+            )
+        try:
+            self.retain_blocks = int(
+                os.environ.get("UCM_RETAIN_BLOCKS", "4")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "UCM_RETAIN_BLOCKS must be an integer"
+            ) from exc
+        if self.retain_blocks < 0:
+            raise ValueError(
+                f"UCM_RETAIN_BLOCKS must be >= 0, "
+                f"got {self.retain_blocks}"
+            )
+        self.offload_stats["what_candidate_blocks"] = 0
+        self.offload_stats["what_retained_blocks"] = 0
+        self.offload_stats["what_pruned_blocks"] = 0
+        logger.info(
+            "UCM WHAT policy=%s retain_ratio=%.3f retain_blocks=%d",
+            self.what_policy,
+            self.retain_ratio,
+            self.retain_blocks,
         )
         self.kv_pressure: Optional[float] = None
         self.pressure_threshold = float(
@@ -1040,6 +1088,88 @@ class UCMDirectConnector(KVConnectorBase_V1):
         )
         return selected_ucm, selected_vllm
 
+    def _apply_what_policy(
+        self,
+        request_all_ucm_block_ids: list[str],
+        selected_ucm_block_ids: list[str],
+        selected_vllm_block_ids: list[int],
+        *,
+        request_id: str,
+        global_start: int,
+        global_end: int,
+    ) -> tuple[list[str], list[int]]:
+        """Apply block-level external-backing retention after WHEN selection."""
+        assert len(selected_ucm_block_ids) == len(selected_vllm_block_ids)
+        candidates = len(selected_ucm_block_ids)
+        self.offload_stats["what_candidate_blocks"] += candidates
+        total_blocks = len(request_all_ucm_block_ids)
+        if self.what_policy == "full":
+            retain_limit = total_blocks
+            retained_ucm = selected_ucm_block_ids
+            retained_vllm = selected_vllm_block_ids
+            reason = "full"
+        elif self.what_policy == "prefix_sparse":
+            retain_limit = min(
+                total_blocks,
+                int(math.ceil(total_blocks * self.retain_ratio)),
+            )
+            allowed = set(
+                request_all_ucm_block_ids[:retain_limit]
+            )
+            retained_ucm = []
+            retained_vllm = []
+            for ucm_id, vllm_id in zip(
+                selected_ucm_block_ids,
+                selected_vllm_block_ids,
+            ):
+                if ucm_id in allowed:
+                    retained_ucm.append(ucm_id)
+                    retained_vllm.append(vllm_id)
+            reason = "prefix_sparse"
+        else:
+            # Keep only the global request frontier. Using the request-global
+            # suffix avoids creating a separate sparse tail for every chunk.
+            retain_limit = min(
+                self.retain_blocks,
+                total_blocks,
+            )
+            allowed = (
+                set(request_all_ucm_block_ids[-retain_limit:])
+                if retain_limit > 0
+                else set()
+            )
+            retained_ucm = []
+            retained_vllm = []
+            for ucm_id, vllm_id in zip(
+                selected_ucm_block_ids,
+                selected_vllm_block_ids,
+            ):
+                if ucm_id in allowed:
+                    retained_ucm.append(ucm_id)
+                    retained_vllm.append(vllm_id)
+            reason = "frontier_tail"
+        retained = len(retained_ucm)
+        pruned = candidates - retained
+        self.offload_stats["what_retained_blocks"] += retained
+        self.offload_stats["what_pruned_blocks"] += pruned
+        logger.info(
+            "UCM_WHAT_DECISION policy=%s ratio=%.3f request_id=%s "
+            "total_blocks=%d retain_limit=%d global_start=%d global_end=%d "
+            "candidates=%d retained=%d pruned=%d reason=%s",
+            self.what_policy,
+            self.retain_ratio,
+            request_id,
+            total_blocks,
+            retain_limit,
+            global_start,
+            global_end,
+            candidates,
+            retained,
+            pruned,
+            reason,
+        )
+        return retained_ucm, retained_vllm
+
     def _generate_dispatch_meta(
         self,
         request_id: str,
@@ -1092,6 +1222,18 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     request_id=request_id,
                 )
             )
+
+            dump_ucm_block_ids, dump_vllm_block_ids = (
+                self._apply_what_policy(
+                    req_meta.ucm_block_ids,
+                    dump_ucm_block_ids,
+                    dump_vllm_block_ids,
+                    request_id=request_id,
+                    global_start=start_idx,
+                    global_end=end_idx,
+                )
+            )
+
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
