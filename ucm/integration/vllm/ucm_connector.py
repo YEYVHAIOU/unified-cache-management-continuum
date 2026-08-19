@@ -432,17 +432,62 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.kv_pressure = kv_pressure
         self.continuum_hints = continuum_hints or {}
 
+    def _estimate_what_retained_blocks(
+        self,
+        request_all_ucm_block_ids: list[str],
+        candidate_ucm_block_ids: list[str],
+    ) -> int:
+        """Predict how many WHEN candidates survive the WHAT policy."""
+        candidates = len(candidate_ucm_block_ids)
+        if candidates == 0:
+            return 0
+        total_blocks = len(request_all_ucm_block_ids)
+        if self.what_policy == "full":
+            return candidates
+        if self.what_policy == "prefix_sparse":
+            retain_limit = min(
+                total_blocks,
+                int(math.ceil(total_blocks * self.retain_ratio)),
+            )
+            allowed = set(
+                request_all_ucm_block_ids[:retain_limit]
+            )
+        else:
+            retain_limit = min(
+                self.retain_blocks,
+                total_blocks,
+            )
+            allowed = (
+                set(request_all_ucm_block_ids[-retain_limit:])
+                if retain_limit > 0
+                else set()
+            )
+        return sum(
+            block_id in allowed
+            for block_id in candidate_ucm_block_ids
+        )
+
     def _apply_offload_policy(
         self,
         ucm_block_ids: list[str],
         vllm_block_ids: list[int],
         request_id: Optional[str] = None,
+        what_effective_blocks: Optional[int] = None,
     ) -> tuple[list[str], list[int]]:
         """Select newly generated KV blocks for backing storage.
         Pressure mode uses live vLLM KV-cache usage to gate backing writes.\n        Joint mode still falls back to eager until Continuum hints are wired.
         """
         assert len(ucm_block_ids) == len(vllm_block_ids)
         candidates = len(ucm_block_ids)
+        effective_candidates = (
+            candidates
+            if what_effective_blocks is None
+            else max(
+                0,
+                min(candidates, int(what_effective_blocks)),
+            )
+        )
+
         self.offload_stats["offload_candidate_blocks"] += candidates
         if candidates == 0:
             return ucm_block_ids, vllm_block_ids
@@ -677,7 +722,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
                             1.0,
 
-                            candidates / context_blocks,
+                            effective_candidates / context_blocks,
 
                         )
 
@@ -719,27 +764,20 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
 
 
-                        dump_ms = (
-
-                            self.dump_cost_intercept_ms
-
-                            + self.dump_cost_per_block_ms
-
-                            * candidates
-
-                        )
-
-                        load_ms = (
-
-                            self.load_cost_intercept_ms
-
-                            + self.load_cost_per_block_ms
-
-                            * candidates
-
-                        )
-
-
+                        if effective_candidates == 0:
+                            dump_ms = 0.0
+                            load_ms = 0.0
+                        else:
+                            dump_ms = (
+                                self.dump_cost_intercept_ms
+                                + self.dump_cost_per_block_ms
+                                * effective_candidates
+                            )
+                            load_ms = (
+                                self.load_cost_intercept_ms
+                                + self.load_cost_per_block_ms
+                                * effective_candidates
+                            )
 
                         external_reuse_probability = (
 
@@ -1069,13 +1107,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
         )
         logger.info(
             "UCM_OFFLOAD_DECISION policy=%s pressure=%s threshold=%.3f "
-            "candidates=%d selected=%d skipped=%d reason=%s "
+            "candidates=%d effective=%d selected=%d skipped=%d reason=%s "
             "p_after_ttl=%.6f benefit_ms=%.6f cost_ms=%.6f "
             "marginal_prefill_ms=%.6f context_blocks=%d p_evict=%.6f",
             self.offload_policy,
             pressure_text,
             self.pressure_threshold,
             candidates,
+            effective_candidates,
             selected,
             skipped,
             reason,
@@ -1215,11 +1254,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
             dump_vllm_block_ids = req_meta.vllm_block_ids[start_idx:end_idx]
             req_meta.token_processed += new_tokens
 
+            what_effective_blocks = (
+                self._estimate_what_retained_blocks(
+                    req_meta.ucm_block_ids,
+                    dump_ucm_block_ids,
+                )
+            )
+
             dump_ucm_block_ids, dump_vllm_block_ids = (
                 self._apply_offload_policy(
                     dump_ucm_block_ids,
                     dump_vllm_block_ids,
                     request_id=request_id,
+                    what_effective_blocks=what_effective_blocks,
                 )
             )
 
