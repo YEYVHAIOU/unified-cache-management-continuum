@@ -195,9 +195,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.joint_decision_mode = os.environ.get(
             "UCM_JOINT_DECISION", "probability"
         ).strip().lower()
-        if self.joint_decision_mode not in {"probability", "cost"}:
+        if self.joint_decision_mode not in {"probability", "cost", "cost_full"}:
             raise ValueError(
-                "UCM_JOINT_DECISION must be probability or cost"
+                "UCM_JOINT_DECISION must be probability, cost, or cost_full"
             )
 
         self.dump_cost_intercept_ms = float(
@@ -399,6 +399,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if candidates == 0:
             return ucm_block_ids, vllm_block_ids
         p_after_ttl_log = -1.0
+        eviction_probability_log = -1.0
         benefit_ms_log = -1.0
         cost_ms_log = -1.0
         marginal_prefill_ms_log = -1.0
@@ -421,105 +422,593 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 selected_vllm = vllm_block_ids
                 reason = "high_pressure_dump"
         else:
-            # Joint mode: pressure handles the extremes; Continuum
-            # decides whether medium-pressure KV is worth backing.
-            if self.kv_pressure is None:
-                selected_ucm = ucm_block_ids
-                selected_vllm = vllm_block_ids
-                reason = "joint_missing_pressure_eager_fallback"
-            elif self.kv_pressure < self.pressure_threshold:
-                selected_ucm = []
-                selected_vllm = []
-                reason = "joint_low_pressure_skip"
-            elif (
-                self.kv_pressure
-                >= self.joint_high_pressure_threshold
-            ):
-                selected_ucm = ucm_block_ids
-                selected_vllm = vllm_block_ids
-                reason = "joint_high_pressure_force_dump"
-            else:
-                hint = self.continuum_hints.get(request_id or "")
-                if hint is None:
-                    selected_ucm = ucm_block_ids
-                    selected_vllm = vllm_block_ids
-                    reason = "joint_missing_hint_pressure_dump"
-                elif hint.get("history_source") == "fixed_cold_start":
-                    selected_ucm = ucm_block_ids
-                    selected_vllm = vllm_block_ids
-                    reason = "joint_cold_start_pressure_dump"
-                else:
-                    finish_probability = float(
-                        hint.get("finish_probability", 0.0)
-                    )
-                    p_after_ttl = max(
-                        0.0, min(1.0, 1.0 - finish_probability)
-                    )
-                    p_after_ttl_log = p_after_ttl
 
-                    if self.joint_decision_mode == "probability":
-                        if (
-                            p_after_ttl
-                            >= self.joint_after_ttl_threshold
-                        ):
-                            selected_ucm = ucm_block_ids
-                            selected_vllm = vllm_block_ids
-                            reason = "joint_temporal_dump"
-                        else:
-                            selected_ucm = []
-                            selected_vllm = []
-                            reason = "joint_temporal_skip"
+            # Joint mode.
+
+            #
+
+            # probability / cost:
+
+            #   Preserve the original P3/P3.5 semantics:
+
+            #   low pressure -> skip, high pressure -> force dump,
+
+            #   medium pressure -> temporal/cost decision.
+
+            #
+
+            # cost_full:
+
+            #   Convert KV pressure into a continuous eviction probability
+
+            #   and evaluate every positive-risk candidate using the measured
+
+            #   D2H/H2D cost model.
+
+            if self.kv_pressure is None:
+
+                selected_ucm = ucm_block_ids
+
+                selected_vllm = vllm_block_ids
+
+                reason = "joint_missing_pressure_eager_fallback"
+
+
+
+            elif self.joint_decision_mode == "cost_full":
+
+                pressure_span = max(
+
+                    1e-9,
+
+                    self.joint_high_pressure_threshold
+
+                    - self.pressure_threshold,
+
+                )
+
+                p_evict = max(
+
+                    0.0,
+
+                    min(
+
+                        1.0,
+
+                        (
+
+                            self.kv_pressure
+
+                            - self.pressure_threshold
+
+                        )
+
+                        / pressure_span,
+
+                    ),
+
+                )
+
+                eviction_probability_log = p_evict
+
+
+
+                if p_evict <= 0.0:
+
+                    selected_ucm = []
+
+                    selected_vllm = []
+
+                    reason = "joint_cost_full_zero_evict_skip"
+
+
+
+                else:
+
+                    hint = self.continuum_hints.get(
+
+                        request_id or ""
+
+                    )
+
+
+
+                    if hint is None:
+
+                        # Without temporal/prefill information a cost
+
+                        # comparison cannot be formed. Preserve the old
+
+                        # safe backing fallback for these rare requests.
+
+                        selected_ucm = ucm_block_ids
+
+                        selected_vllm = vllm_block_ids
+
+                        reason = (
+
+                            "joint_cost_full_missing_hint_dump"
+
+                        )
+
+
+
+                    elif hint.get("is_terminal", False):
+                        selected_ucm = []
+                        selected_vllm = []
+                        reason = "joint_cost_full_terminal_skip"
                     else:
+
+                        # fixed_cold_start uses finish_probability=0 as
+
+                        # "no history". Treat p_after=1 as an upper bound,
+
+                        # which intentionally favors backing.
+
+                        if (
+
+                            hint.get("history_source")
+
+                            == "fixed_cold_start"
+
+                        ):
+
+                            p_after_ttl = 1.0
+
+                        else:
+
+                            finish_probability = float(
+
+                                hint.get(
+
+                                    "finish_probability", 0.0
+
+                                )
+
+                            )
+
+                            p_after_ttl = max(
+
+                                0.0,
+
+                                min(
+
+                                    1.0,
+
+                                    1.0 - finish_probability,
+
+                                ),
+
+                            )
+
+
+
+                        p_after_ttl_log = p_after_ttl
+
+
+
                         context_tokens = max(
-                            1, int(hint.get("context_tokens", 1))
-                        )
-                        context_blocks = max(
+
                             1,
-                            (context_tokens + self.block_size - 1)
-                            // self.block_size,
+
+                            int(
+
+                                hint.get(
+
+                                    "context_tokens", 1
+
+                                )
+
+                            ),
+
                         )
+
+                        context_blocks = max(
+
+                            1,
+
+                            (
+
+                                context_tokens
+
+                                + self.block_size
+
+                                - 1
+
+                            )
+
+                            // self.block_size,
+
+                        )
+
                         context_blocks_log = context_blocks
 
+
+
                         marginal_fraction = min(
-                            1.0, candidates / context_blocks
+
+                            1.0,
+
+                            candidates / context_blocks,
+
                         )
+
+
+
                         prefill_total_ms = max(
+
                             0.0,
+
                             float(
-                                hint.get("prefill_reload_cost", 0.0)
-                            ) * 1000.0,
+
+                                hint.get(
+
+                                    "prefill_reload_cost", 0.0
+
+                                )
+
+                            )
+
+                            * 1000.0,
+
                         )
+
+
+
                         marginal_prefill_ms = (
-                            prefill_total_ms * marginal_fraction
+
+                            prefill_total_ms
+
+                            * marginal_fraction
+
                         )
-                        marginal_prefill_ms_log = marginal_prefill_ms
+
+                        marginal_prefill_ms_log = (
+
+                            marginal_prefill_ms
+
+                        )
+
+
 
                         dump_ms = (
+
                             self.dump_cost_intercept_ms
-                            + self.dump_cost_per_block_ms * candidates
+
+                            + self.dump_cost_per_block_ms
+
+                            * candidates
+
                         )
+
                         load_ms = (
+
                             self.load_cost_intercept_ms
-                            + self.load_cost_per_block_ms * candidates
+
+                            + self.load_cost_per_block_ms
+
+                            * candidates
+
                         )
+
+
+
+                        external_reuse_probability = (
+
+                            p_after_ttl * p_evict
+
+                        )
+
+
 
                         benefit_ms = (
-                            p_after_ttl * marginal_prefill_ms
+
+                            external_reuse_probability
+
+                            * marginal_prefill_ms
+
                         )
+
                         expected_cost_ms = (
-                            dump_ms + p_after_ttl * load_ms
+
+                            dump_ms
+
+                            + external_reuse_probability
+
+                            * load_ms
+
                         )
+
+
+
                         benefit_ms_log = benefit_ms
+
                         cost_ms_log = expected_cost_ms
 
+
+
                         if benefit_ms > expected_cost_ms:
+
                             selected_ucm = ucm_block_ids
+
                             selected_vllm = vllm_block_ids
-                            reason = "joint_cost_dump"
+
+                            reason = "joint_cost_full_dump"
+
                         else:
+
                             selected_ucm = []
+
                             selected_vllm = []
+
+                            reason = "joint_cost_full_skip"
+
+
+
+            elif self.kv_pressure < self.pressure_threshold:
+
+                selected_ucm = []
+
+                selected_vllm = []
+
+                reason = "joint_low_pressure_skip"
+
+
+
+            elif (
+
+                self.kv_pressure
+
+                >= self.joint_high_pressure_threshold
+
+            ):
+
+                selected_ucm = ucm_block_ids
+
+                selected_vllm = vllm_block_ids
+
+                reason = "joint_high_pressure_force_dump"
+
+
+
+            else:
+
+                hint = self.continuum_hints.get(request_id or "")
+
+
+
+                if hint is None:
+
+                    selected_ucm = ucm_block_ids
+
+                    selected_vllm = vllm_block_ids
+
+                    reason = "joint_missing_hint_pressure_dump"
+
+
+
+                elif (
+
+                    hint.get("history_source")
+
+                    == "fixed_cold_start"
+
+                ):
+
+                    selected_ucm = ucm_block_ids
+
+                    selected_vllm = vllm_block_ids
+
+                    reason = "joint_cold_start_pressure_dump"
+
+
+
+                else:
+
+                    finish_probability = float(
+
+                        hint.get("finish_probability", 0.0)
+
+                    )
+
+                    p_after_ttl = max(
+
+                        0.0,
+
+                        min(
+
+                            1.0,
+
+                            1.0 - finish_probability,
+
+                        ),
+
+                    )
+
+                    p_after_ttl_log = p_after_ttl
+
+
+
+                    if (
+
+                        self.joint_decision_mode
+
+                        == "probability"
+
+                    ):
+
+                        if (
+
+                            p_after_ttl
+
+                            >= self.joint_after_ttl_threshold
+
+                        ):
+
+                            selected_ucm = ucm_block_ids
+
+                            selected_vllm = vllm_block_ids
+
+                            reason = "joint_temporal_dump"
+
+                        else:
+
+                            selected_ucm = []
+
+                            selected_vllm = []
+
+                            reason = "joint_temporal_skip"
+
+
+
+                    else:
+
+                        context_tokens = max(
+
+                            1,
+
+                            int(
+
+                                hint.get(
+
+                                    "context_tokens", 1
+
+                                )
+
+                            ),
+
+                        )
+
+                        context_blocks = max(
+
+                            1,
+
+                            (
+
+                                context_tokens
+
+                                + self.block_size
+
+                                - 1
+
+                            )
+
+                            // self.block_size,
+
+                        )
+
+                        context_blocks_log = context_blocks
+
+
+
+                        marginal_fraction = min(
+
+                            1.0,
+
+                            candidates / context_blocks,
+
+                        )
+
+
+
+                        prefill_total_ms = max(
+
+                            0.0,
+
+                            float(
+
+                                hint.get(
+
+                                    "prefill_reload_cost", 0.0
+
+                                )
+
+                            )
+
+                            * 1000.0,
+
+                        )
+
+
+
+                        marginal_prefill_ms = (
+
+                            prefill_total_ms
+
+                            * marginal_fraction
+
+                        )
+
+                        marginal_prefill_ms_log = (
+
+                            marginal_prefill_ms
+
+                        )
+
+
+
+                        dump_ms = (
+
+                            self.dump_cost_intercept_ms
+
+                            + self.dump_cost_per_block_ms
+
+                            * candidates
+
+                        )
+
+                        load_ms = (
+
+                            self.load_cost_intercept_ms
+
+                            + self.load_cost_per_block_ms
+
+                            * candidates
+
+                        )
+
+
+
+                        benefit_ms = (
+
+                            p_after_ttl
+
+                            * marginal_prefill_ms
+
+                        )
+
+                        expected_cost_ms = (
+
+                            dump_ms
+
+                            + p_after_ttl * load_ms
+
+                        )
+
+
+
+                        benefit_ms_log = benefit_ms
+
+                        cost_ms_log = expected_cost_ms
+
+
+
+                        if benefit_ms > expected_cost_ms:
+
+                            selected_ucm = ucm_block_ids
+
+                            selected_vllm = vllm_block_ids
+
+                            reason = "joint_cost_dump"
+
+                        else:
+
+                            selected_ucm = []
+
+                            selected_vllm = []
+
                             reason = "joint_cost_skip"
+
         selected = len(selected_ucm)
         skipped = candidates - selected
         self.offload_stats["offload_selected_blocks"] += selected
@@ -534,7 +1023,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             "UCM_OFFLOAD_DECISION policy=%s pressure=%s threshold=%.3f "
             "candidates=%d selected=%d skipped=%d reason=%s "
             "p_after_ttl=%.6f benefit_ms=%.6f cost_ms=%.6f "
-            "marginal_prefill_ms=%.6f context_blocks=%d",
+            "marginal_prefill_ms=%.6f context_blocks=%d p_evict=%.6f",
             self.offload_policy,
             pressure_text,
             self.pressure_threshold,
@@ -547,6 +1036,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             cost_ms_log,
             marginal_prefill_ms_log,
             context_blocks_log,
+            eviction_probability_log,
         )
         return selected_ucm, selected_vllm
 
