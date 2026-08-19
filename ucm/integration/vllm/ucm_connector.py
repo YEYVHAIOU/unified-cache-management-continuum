@@ -123,6 +123,27 @@ class UCMDirectConnector(KVConnectorBase_V1):
         ucm_config = Config(vllm_config.kv_transfer_config)
         self.launch_config = ucm_config.get_config()
 
+        # Coordinated offload policy scaffold.
+        # P1 preserves legacy eager behavior. Pressure/joint are accepted
+        # but deliberately fall back to eager until their inputs are wired.
+        self.offload_policy = os.environ.get(
+            "UCM_OFFLOAD_POLICY", "eager"
+        ).strip().lower()
+        valid_offload_policies = {"eager", "pressure", "joint"}
+        if self.offload_policy not in valid_offload_policies:
+            raise ValueError(
+                f"Invalid UCM_OFFLOAD_POLICY={self.offload_policy!r}; "
+                f"expected one of {sorted(valid_offload_policies)}"
+            )
+        self.offload_stats = {
+            "offload_candidate_blocks": 0,
+            "offload_selected_blocks": 0,
+            "offload_skipped_blocks": 0,
+            "dump_batches": 0,
+            "load_batches": 0,
+            "load_blocks": 0,
+        }
+        logger.info("UCM offload policy=%s", self.offload_policy)
         self.load_only_first_rank: bool = (
             self.launch_config.get("load_only_first_rank", self.is_mla) and self.is_mla
         )
@@ -264,6 +285,45 @@ class UCMDirectConnector(KVConnectorBase_V1):
     ):
         pass
 
+    def _apply_offload_policy(
+        self,
+        ucm_block_ids: list[str],
+        vllm_block_ids: list[int],
+    ) -> tuple[list[str], list[int]]:
+        """Select newly generated KV blocks for backing storage.
+        P1 is behavior-preserving. The pressure and joint modes intentionally
+        use eager fallback until vLLM pressure and Continuum hints are wired.
+        """
+        assert len(ucm_block_ids) == len(vllm_block_ids)
+        candidates = len(ucm_block_ids)
+        self.offload_stats["offload_candidate_blocks"] += candidates
+        if candidates == 0:
+            return ucm_block_ids, vllm_block_ids
+        if self.offload_policy == "eager":
+            selected_ucm = ucm_block_ids
+            selected_vllm = vllm_block_ids
+            reason = "eager"
+        else:
+            selected_ucm = ucm_block_ids
+            selected_vllm = vllm_block_ids
+            reason = f"{self.offload_policy}_scaffold_eager_fallback"
+        selected = len(selected_ucm)
+        skipped = candidates - selected
+        self.offload_stats["offload_selected_blocks"] += selected
+        self.offload_stats["offload_skipped_blocks"] += skipped
+        if selected:
+            self.offload_stats["dump_batches"] += 1
+        logger.info(
+            "UCM_OFFLOAD_DECISION policy=%s candidates=%d "
+            "selected=%d skipped=%d reason=%s",
+            self.offload_policy,
+            candidates,
+            selected,
+            skipped,
+            reason,
+        )
+        return selected_ucm, selected_vllm
+
     def _generate_dispatch_meta(
         self,
         req_meta: RequestMeta,
@@ -294,6 +354,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
             load_ucm_block_ids = ucm_block_ids[hbm_hit_block_num:total_hit_block_num]
             load_vllm_block_ids = vllm_block_ids[hbm_hit_block_num:total_hit_block_num]
 
+        if load_ucm_block_ids:
+            self.offload_stats["load_batches"] += 1
+            self.offload_stats["load_blocks"] += len(load_ucm_block_ids)
+            logger.info(
+                "UCM_LOAD_DECISION blocks=%d",
+                len(load_ucm_block_ids),
+            )
         if req_meta.token_processed < req_meta.num_token_ids:
             start_idx = req_meta.token_processed // self.block_size
             end_idx = (req_meta.token_processed + new_tokens) // self.block_size
@@ -301,6 +368,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
             dump_vllm_block_ids = req_meta.vllm_block_ids[start_idx:end_idx]
             req_meta.token_processed += new_tokens
 
+            dump_ucm_block_ids, dump_vllm_block_ids = (
+                self._apply_offload_policy(
+                    dump_ucm_block_ids,
+                    dump_vllm_block_ids,
+                )
+            )
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
