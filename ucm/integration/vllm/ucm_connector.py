@@ -130,7 +130,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.offload_policy = os.environ.get(
             "UCM_OFFLOAD_POLICY", "eager"
         ).strip().lower()
-        valid_offload_policies = {"eager", "pressure", "joint"}
+        valid_offload_policies = {"eager", "pressure", "joint", "disabled"}
         if self.offload_policy not in valid_offload_policies:
             raise ValueError(
                 f"Invalid UCM_OFFLOAD_POLICY={self.offload_policy!r}; "
@@ -341,6 +341,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
             )
 
     def generate_hash(self, block_size: int, request: "Request") -> list[str]:
+        # Legacy UCM hashing path. Keep this as a compatibility fallback for
+        # requests whose vLLM block hashes are unavailable or incomplete.
         token_ids = request.all_token_ids
 
         ret = []
@@ -370,7 +372,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
         hbm_hit_block_num = num_computed_tokens // self.block_size
 
         ucm_block_ids = self.generate_hash(self.block_size, request)
-
         external_block_ids = ucm_block_ids[hbm_hit_block_num:]
         if not external_block_ids:
             return 0, False
@@ -1248,6 +1249,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 len(load_ucm_block_ids),
             )
         if req_meta.token_processed < req_meta.num_token_ids:
+            if self.offload_policy == "disabled":
+                req_meta.token_processed += new_tokens
+                return RequestDispatchMeta(
+                    (load_ucm_block_ids, load_vllm_block_ids),
+                    (dump_ucm_block_ids, dump_vllm_block_ids),
+                )
+
             start_idx = req_meta.token_processed // self.block_size
             end_idx = (req_meta.token_processed + new_tokens) // self.block_size
             dump_ucm_block_ids = ucm_block_ids[start_idx:end_idx]
@@ -1463,6 +1471,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
+        # UCM_EMPTY_TRANSFER_FASTPATH_V1: avoid entering the worker-side
+        # connector pipeline when this model step has no external KV load.
+        if not any(
+            request.load_block_ids[0]
+            for request in metadata.request_meta.values()
+        ):
+            return
+
         self._init_kv_caches_from_forward_context(forward_context)
 
         request_to_task: dict[str, Optional[Task]] = {}
@@ -1580,11 +1596,20 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # TODO support PP
         if (self.is_mla or self.is_dsa) and self.global_rank != 0:
             return
-        if self.metrics_config:
-            self.synchronize()
 
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
+
+        # UCM_EMPTY_TRANSFER_FASTPATH_V1: there is nothing to wait for when
+        # this model step contains no external KV dump operation.
+        if not any(
+            request.dump_block_ids[0]
+            for request in metadata.request_meta.values()
+        ):
+            return
+
+        if self.metrics_config:
+            self.synchronize()
 
         request_to_task: dict[str, Task] = {}
         request_to_blocks: dict[str, list[str]] = {}
@@ -1814,6 +1839,9 @@ class UCMConnector(KVConnectorBase_V1):
         else:
             self.connector = UCMDirectConnector(vllm_config, role)
 
+        self._active_load = False
+        self._active_save = False
+
     def set_runtime_context(self, **kwargs) -> None:
         setter = getattr(self.connector, "set_runtime_context", None)
         if callable(setter):
@@ -1862,15 +1890,18 @@ class UCMConnector(KVConnectorBase_V1):
         return self.connector.build_connector_meta(scheduler_output)
 
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
-        """Set the connector metadata from the scheduler.
-
-        This function should be called by the model runner every time
-        before the model execution. The metadata will be used for runtime
-        KV cache loading and saving.
-
-        Args:
-            connector_metadata (dict): the connector metadata.
-        """
+        if isinstance(connector_metadata, UCMConnectorMetadata):
+            self._active_load = any(
+                request.load_block_ids[0]
+                for request in connector_metadata.request_meta.values()
+            )
+            self._active_save = any(
+                request.dump_block_ids[0]
+                for request in connector_metadata.request_meta.values()
+            )
+        else:
+            self._active_load = True
+            self._active_save = True
         self.connector.bind_connector_metadata(connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -1940,4 +1971,6 @@ class UCMConnector(KVConnectorBase_V1):
         This function should be called by the model runner every time
         after the model execution.
         """
+        self._active_load = False
+        self._active_save = False
         self.connector.clear_connector_metadata()
