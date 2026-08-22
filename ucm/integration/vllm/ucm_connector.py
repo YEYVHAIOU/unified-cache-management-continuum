@@ -1471,6 +1471,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
+        self._init_kv_caches_from_forward_context(forward_context)
+
         # UCM_EMPTY_TRANSFER_FASTPATH_V1: avoid entering the worker-side
         # connector pipeline when this model step has no external KV load.
         if not any(
@@ -1478,8 +1480,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
             for request in metadata.request_meta.values()
         ):
             return
-
-        self._init_kv_caches_from_forward_context(forward_context)
 
         request_to_task: dict[str, Optional[Task]] = {}
         request_to_submit_start_ms: dict[str, float] = {}
